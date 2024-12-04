@@ -165,18 +165,19 @@ class ReadCachePersistentMemoryMalloc : public PersistentMemoryMalloc<D> {
 
  private:
   inline void PageAlignedShiftHeadAddress(uint32_t tail_page) final {
-    //obtain local values of variables that can change
+    static constexpr uint32_t kNumHeadPages = PersistentMemoryMalloc<D>::kNumHeadPages;
+
+    // obtain local values of variables that can change
     Address current_head_address = this->head_address.load();
     Address current_flushed_until_address = this->flushed_until_address.load();
+    uint32_t num_pages = this->buffer_.num_pages;
 
-    if(tail_page <= (this->buffer_size_ - PersistentMemoryMalloc<D>::kNumHeadPages)) {
+    if(tail_page <= (num_pages - kNumHeadPages)) {
       // Desired head address is <= 0.
       return;
     }
 
-    Address desired_head_address{
-      tail_page - (this->buffer_size_ - PersistentMemoryMalloc<D>::kNumHeadPages), 0 };
-
+    Address desired_head_address{ tail_page - (num_pages - kNumHeadPages), 0 };
     if(current_flushed_until_address < desired_head_address) {
       desired_head_address = Address{ current_flushed_until_address.page(), 0 };
     }

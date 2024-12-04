@@ -18,6 +18,7 @@
 #include "light_epoch.h"
 #include "native_buffer_pool.h"
 #include "recovery_status.h"
+#include "state_transitions.h"
 #include "status.h"
 
 namespace FASTER {
@@ -229,6 +230,116 @@ class AtomicPageOffset {
 };
 static_assert(sizeof(AtomicPageOffset) == 8, "sizeof(AtomicPageOffset) != 8");
 
+// Circular buffer definition
+class CircularBuffer {
+ public:
+  CircularBuffer()
+    : pages{ nullptr }
+    , page_status{ nullptr }
+    , max_pages{ 0 }
+    , num_pages{ 0 }
+    , num_mutable_pages{ 0 }
+    , num_allocated_pages_{ 0 } {
+  }
+  ~CircularBuffer() {
+    Clear();
+  }
+
+  void Init(uint32_t max_size) {
+    max_pages = max_size;
+    pages = new uint8_t* [max_pages];
+    page_status = new FullPageStatus[max_pages];
+
+    for (uint32_t idx = 0; idx < max_pages; idx++) {
+      pages[idx] = nullptr;
+      page_status[idx].LastFlushedUntilAddress.store(0);
+      page_status[idx].status.store(FlushStatus::Flushed, CloseStatus::Closed);
+    }
+  }
+  void Clear() {
+    if(pages) {
+      for(uint32_t idx = 0; idx < max_pages; ++idx) {
+        if (pages[idx]) {
+          aligned_free(pages[idx]);
+        }
+      }
+      delete[] pages;
+      pages = nullptr;
+    }
+    if(page_status) {
+      delete[] page_status;
+      page_status = nullptr;
+    }
+    uint8_t* page;
+    while(free_pages_queue_.try_pop(page)) {
+      aligned_free(page);
+    }
+  }
+
+  bool InStableState() {
+    return num_pages.load() == num_allocated_pages_.load();
+  }
+
+  void AllocatePage(uint32_t index, uint64_t bytes, uint32_t alignment) {
+    if (!pages || !page_status) {
+      throw std::runtime_error{ "Buffer is not allocated" };
+    }
+    if (pages[index]) {
+      log_warn("Buffer page [%u] is already allocated! Returning...", index);
+      return;
+    }
+
+    uint8_t* page = nullptr;
+    if (!free_pages_queue_.try_pop(page)) {
+      // No free pages available -- allocate new page
+      ++num_allocated_pages_;
+      page = reinterpret_cast<uint8_t*>(aligned_alloc(alignment, bytes));
+      log_debug("No page in queue -- allocating new page: %p", page);
+    } else {
+      log_debug("Free page exists in queue: %p", page);
+    }
+    assert(page != nullptr);
+    // Clear and set page
+    pages[index] = page;
+    std::memset(pages[index], 0, bytes);
+
+    // Mark the page as accessible.
+    page_status[index].status.store(FlushStatus::Flushed, CloseStatus::Open);
+    log_debug("Allocated %lu pages", num_allocated_pages_.load());
+  }
+
+  void FreePage(uint32_t index) {
+    if (!pages[index]) {
+      log_warn("Buffer page [%u] is already freed! Returning...", index);
+      return;
+    }
+    uint8_t* page = pages[index];
+    if (num_allocated_pages_ - 1 < num_pages) {
+      // do not free page -- it is going to be requested soon
+      log_debug("Storing page to queue: %p", page);
+      free_pages_queue_.push(page);
+    } else {
+      log_debug("Deallocating page from memory: %p", page);
+      aligned_free(page);
+      --num_allocated_pages_;
+    }
+    pages[index] = nullptr;
+    log_debug("Allocated %lu pages", num_allocated_pages_.load());
+  }
+
+ public:
+  uint8_t** pages;
+  FullPageStatus* page_status;
+  uint32_t max_pages;
+
+  std::atomic<uint32_t> num_pages;
+  std::atomic<uint32_t> num_mutable_pages;
+
+ private:
+  std::atomic<uint32_t> num_allocated_pages_;
+  concurrent_queue<uint8_t*> free_pages_queue_;
+};
+
 /// The main allocator.
 template <class D>
 class PersistentMemoryMalloc {
@@ -238,18 +349,22 @@ class PersistentMemoryMalloc {
   typedef typename D::log_file_t log_file_t;
   typedef PersistentMemoryMalloc<disk_t> alloc_t;
 
+  typedef void(*resize_done_callback_t)(void);
+
   /// Each page in the buffer is 2^25 bytes (= 32 MB).
   static constexpr uint64_t kPageSize = Address::kMaxOffset + 1;
 
   /// The first 4 HLOG pages should be below the head (i.e., being flushed to disk).
   static constexpr uint32_t kNumHeadPages = 4;
 
+  /// Max pages stored in-memory (4096 pages -> 128 GiB)
+  static constexpr uint32_t kMaxNumInMemPages = 4096;
+
   PersistentMemoryMalloc(bool has_no_backing_storage, uint64_t log_size, LightEpoch& epoch, disk_t& disk_, log_file_t& file_,
                          Address start_address, double log_mutable_fraction, bool pre_allocate_log)
     : sector_size{ static_cast<uint32_t>(file_.alignment()) }
     , epoch_{ &epoch }
     , disk{ &disk_ }
-    , buffer_size_{ 0 }
     , file{ &file_ }
     , read_buffer_pool{ 1, sector_size }
     , io_buffer_pool{ 1, sector_size }
@@ -260,16 +375,16 @@ class PersistentMemoryMalloc {
     , flushed_until_address{ start_address }
     , begin_address{ start_address }
     , tail_page_offset_{ start_address }
-    , pre_allocate_log_{ pre_allocate_log }
+    , pre_allocate_log_{ false }
     , has_no_backing_storage_{ has_no_backing_storage }
-    , pages_{ nullptr }
-    , page_status_{ nullptr } {
+    , resize_in_progress_{ false } {
     assert(start_address.page() <= Address::kMaxPage);
 
     log_debug("Log size: %.3lf MiB", static_cast<double>(log_size) / (1 << 20));
     log_debug("Mutable fraction: %.3lf", log_mutable_fraction);
     log_debug("Pre-allocate: %s", pre_allocate_log ? "TRUE" : "FALSE");
 
+    buffer_.Init(kMaxNumInMemPages);
     InitializeBuffer(log_size, log_mutable_fraction);
   }
 
@@ -290,30 +405,26 @@ class PersistentMemoryMalloc {
     flushed_until_address.store(tail_address);
   }
 
-  virtual ~PersistentMemoryMalloc() {
-    FreeBuffer();
-  }
-
   inline const uint8_t* Page(uint32_t page) const {
     assert(page <= Address::kMaxPage);
-    return pages_[page % buffer_size_];
+    return buffer_.pages[page % buffer_.max_pages];
   }
   inline uint8_t* Page(uint32_t page) {
     assert(page <= Address::kMaxPage);
-    return pages_[page % buffer_size_];
+    return buffer_.pages[page % buffer_.max_pages];
   }
 
   inline const FullPageStatus& PageStatus(uint32_t page) const {
     assert(page <= Address::kMaxPage);
-    return page_status_[page % buffer_size_];
+    return buffer_.page_status[page % buffer_.max_pages];
   }
   inline FullPageStatus& PageStatus(uint32_t page) {
     assert(page <= Address::kMaxPage);
-    return page_status_[page % buffer_size_];
+    return buffer_.page_status[page % buffer_.max_pages];
   }
 
   inline uint32_t buffer_size() const {
-    return buffer_size_;
+    return buffer_.num_pages.load();
   }
 
   /// Read the tail page + offset, atomically, and convert it to an address.
@@ -389,8 +500,9 @@ class PersistentMemoryMalloc {
       disk->TryComplete();
 
       all_flushed = true;
-      for (size_t idx = 0; idx < buffer_size_ && all_flushed; idx++) {
-        all_flushed &= (page_status_[idx].status.load().Ready() || !pages_[idx]);
+      uint32_t num_pages = buffer_.num_pages.load();
+      for (size_t idx = 0; idx < num_pages && all_flushed; idx++) {
+        all_flushed &= (buffer_.page_status[idx].status.load().Ready() || !buffer_.pages[idx]);
       }
     } while(!all_flushed);
 
@@ -418,8 +530,42 @@ class PersistentMemoryMalloc {
     }
 
     // Resize buffer
-    FreeBuffer();
+    buffer_.Clear();
     InitializeBuffer(log_size, log_mutable_pct);
+  }
+
+  void Resize(uint64_t new_log_size, resize_done_callback_t callback = nullptr) {
+    // Keep the same log mutable fraction
+    double new_log_mutable_fraction = static_cast<double>(buffer_.num_mutable_pages) / buffer_.num_pages;
+    Resize(new_log_size, new_log_mutable_fraction, callback);
+  }
+
+  void Resize(uint32_t new_log_size, double new_log_mutable_fraction, resize_done_callback_t callback = nullptr) {
+    bool expected = false;
+    if (!resize_in_progress_.compare_exchange_strong(expected, true)) {
+      throw std::runtime_error{ "Active resizing in progress" };
+    }
+
+    EnsureValidBufferArgs(new_log_size, new_log_mutable_fraction, false);
+    uint32_t num_pages = static_cast<uint32_t>(new_log_size / kPageSize);
+    uint32_t num_mutable_pages = static_cast<uint32_t>(num_pages * new_log_mutable_fraction);
+
+    bool shrink_log = (buffer_.num_pages > num_pages);
+    log_info("%s hlog: %u -> %u pages", shrink_log ? "Shrinking" : "Growing",
+             buffer_.num_pages.load(), num_pages);
+    log_info("New hlog properties: %.2lf MiB [mutable: %.2lf%%]",
+             static_cast<double>(new_log_size) / (1 << 20UL), new_log_mutable_fraction * 100);
+
+    if (shrink_log) {
+      // First reduce mutable pages, then mem log size
+      buffer_.num_mutable_pages.store(num_mutable_pages);
+      buffer_.num_pages.store(num_pages);
+    } else {
+      // First increase mem log size, then mutable pages
+      buffer_.num_pages.store(num_pages);
+      buffer_.num_mutable_pages.store(num_mutable_pages);
+    }
+    resize_callback_ = callback;
   }
 
   void Truncate(const GcState& gc_state);
@@ -504,7 +650,9 @@ class PersistentMemoryMalloc {
   }
 
   /// Allocate memory page, in sector aligned form
-  inline void AllocatePage(uint32_t index);
+  inline void AllocatePage(uint32_t page);
+  /// Free memory page
+  inline void FreePage(uint32_t page);
 
  protected:
   /// Used by several functions to update the variable to newValue. Ignores if newValue is smaller
@@ -572,78 +720,108 @@ class PersistentMemoryMalloc {
     }
   }
 
-  inline void InitializeBuffer(uint64_t log_size, double log_mutable_fraction) {
-    assert(!pages_ && !page_status_);
-
+  inline void EnsureValidBufferArgs(uint64_t& log_size, double& log_mutable_fraction, bool throw_ = true) {
+    /// Hybrid log size
     if(log_size % kPageSize != 0) {
-      throw std::invalid_argument{ "Log size must be a multiple of 32 MB" };
+      if (throw_) {
+        throw std::invalid_argument{ "Log size must be a multiple of 32 MB" };
+      } else {
+        uint64_t old_log_size = log_size;
+        log_size -= (log_size % kPageSize);
+        log_info("Log size *not* multiple of page size (i.e., 32 MiB). "
+                 "Adjusting log size to %lu (from %lu)", log_size, old_log_size);
+      }
     }
-    if(log_size / kPageSize > UINT32_MAX) {
-      throw std::invalid_argument{ "Log size must be <= 128 PB" };
+    uint64_t num_pages = log_size / kPageSize;
+    if(num_pages > UINT32_MAX) {
+      if (throw_) {
+        throw std::invalid_argument{ "Log size must be <= 128 PB" };
+      } else {
+        uint64_t old_log_size = log_size;
+        log_size = kPageSize * UINT32_MAX;
+        log_info("Log size larger than maximum (i.e., >= 128 PB). "
+                 "Adjusting log size to %lu (from %lu)", log_size, old_log_size);
+        num_pages = UINT32_MAX;
+      }
     }
-    buffer_size_ = static_cast<uint32_t>(log_size / kPageSize);
+    if(num_pages <= kNumHeadPages + 1) {
+      if (throw_) {
+        throw std::invalid_argument{ "Must have at least 2 non-head pages" };
+      } else {
+        log_info("Log size too small (i.e., <= 160 MiB). "
+                 "Adjusting num pages to %u (from %u)", num_pages, kNumHeadPages + 2);
+        num_pages = kNumHeadPages + 2;
+        log_size = num_pages * kPageSize;
+      }
+    }
 
-    if(buffer_size_ <= kNumHeadPages + 1) {
-      throw std::invalid_argument{ "Must have at least 2 non-head pages" };
-    }
+    /// Mutable pages
     // The latest N pages should be mutable.
     // If mutable fraction is 0, then allocate minimum size possible (i.e. 2 mutable pages)
-    num_mutable_pages_ = (log_mutable_fraction > 0) ? static_cast<uint32_t>(log_mutable_fraction * buffer_size_) : 2;
-    log_debug("Num mutable_pages = %u", num_mutable_pages_);
-
-    if(num_mutable_pages_ <= 1) {
+    uint32_t num_mutable_pages;
+    if (log_mutable_fraction > 0) {
+      num_mutable_pages = static_cast<uint32_t>(log_mutable_fraction * num_pages);
       // Need at least two mutable pages: one to write to, and one to open up when the previous
       // mutable page is full.
-      throw std::invalid_argument{ "Must have at least 2 mutable pages" };
+      if(num_mutable_pages <= 1) {
+        if (throw_) {
+          throw std::invalid_argument{ "Must have at least 2 mutable pages" };
+        } else {
+          log_info("Too few log mutable pages (i.e., %u). Adjusting num mutable pages to 2", num_mutable_pages);
+          num_mutable_pages = 2;
+        }
+      }
+    } else {
+      num_mutable_pages = 2;
+      log_info("Provided log mutable fraction is zero. Using 2 mutable pages!");
     }
+    log_mutable_fraction = static_cast<double>(num_mutable_pages) / num_pages;
 
     // Make sure we have at least 'kNumHeadPages' immutable pages.
     // Otherwise, we will not be able to dump log to disk when our in-memory log is full.
     // If the user is certain that we will never need to dump anything to disk
     // (this is the case in compaction), skip this check.
-    if(!has_no_backing_storage_ && buffer_size_ - num_mutable_pages_ < kNumHeadPages) {
-      log_error("Number of non-mutable pages (%u) is less than 'kNumHeadPages' (4)", buffer_size_ - num_mutable_pages_, kNumHeadPages);
-      log_info("For given log size (%.3lf MiB) set mutable fraction to *no more* than %.3lf.",
-        static_cast<double>(log_size) / (1 << 20),
-        1.0 - static_cast<double>((kNumHeadPages * kPageSize))/static_cast<double>(log_size));
+    if(!has_no_backing_storage_ && num_pages - num_mutable_pages < kNumHeadPages) {
+      auto log_level = throw_ ? Lvl::ERROR : Lvl::INFO;
+      logMessage(log_level, "Number of non-mutable pages [%u] is less than 'kNumHeadPages' [4]",
+                 num_pages - num_mutable_pages, kNumHeadPages);
 
-      throw std::invalid_argument{ "Must have at least 'kNumHeadPages' immutable pages" };
-    }
+      double max_valid_log_mutable_faction = \
+        1.0 - static_cast<double>((kNumHeadPages * kPageSize))/static_cast<double>(log_size);
 
-    page_status_ = new FullPageStatus[buffer_size_];
-
-    pages_ = new uint8_t* [buffer_size_];
-    for(uint32_t idx = 0; idx < buffer_size_; ++idx) {
-      if (pre_allocate_log_) {
-        pages_[idx] = reinterpret_cast<uint8_t*>(aligned_alloc(sector_size, kPageSize));
-        std::memset(pages_[idx], 0, kPageSize);
-        // Mark the page as accessible.
-        page_status_[idx].status.store(FlushStatus::Flushed, CloseStatus::Open);
+      if (throw_) {
+        log_error("For given log size (%lu) set mutable fraction to *no more* than %.3lf.",
+                  max_valid_log_mutable_faction);
+        throw std::invalid_argument{ "Must have at least 'kNumHeadPages' immutable pages" };
       } else {
-        pages_[idx] = nullptr;
+        log_info("Too few immutable pages (i.e., %u). Adjusting log mutable fraction to %.3lf",
+                 max_valid_log_mutable_faction);
+        log_mutable_fraction = max_valid_log_mutable_faction;
       }
     }
+  }
+
+  inline void InitializeBuffer(uint64_t log_size, double log_mutable_fraction) {
+    EnsureValidBufferArgs(log_size, log_mutable_fraction, true);
+
+    uint32_t num_pages = log_size / kPageSize;
+    uint32_t num_mutable_pages = static_cast<uint32_t>(num_pages * log_mutable_fraction);
+
+    log_info("Initializing Hlog:");
+    log_info("\tLog  Size : %lu [%.3lf MiB]", log_size,
+             static_cast<double>(log_size) / (1 << 20UL));
+    log_info("\tMut. Frac : %.3lf", log_mutable_fraction);
+    log_info("\tLog  Pages: %lu", num_pages);
+    log_info("\tMut. Pages: %lu", num_mutable_pages);
+
+    buffer_.num_pages.store(num_pages);
+    buffer_.num_mutable_pages.store(num_mutable_pages);
 
     PageOffset tail_page_offset = tail_page_offset_.load();
     AllocatePage(tail_page_offset.page());
     AllocatePage(tail_page_offset.page() + 1);
   }
 
-  inline void FreeBuffer() {
-    if(pages_) {
-      for(uint32_t idx = 0; idx < buffer_size_; ++idx) {
-        if(pages_[idx]) {
-          aligned_free(pages_[idx]);
-        }
-      }
-      delete[] pages_;
-      pages_ = nullptr;
-    }
-    if(page_status_) {
-      delete[] page_status_;
-      page_status_ = nullptr;
-    }
-  }
 
  public:
   uint32_t sector_size;
@@ -652,10 +830,9 @@ class PersistentMemoryMalloc {
   LightEpoch* epoch_;
   disk_t* disk;
 
-  uint32_t buffer_size_;
-
  public:
   log_file_t* file;
+
   // Read buffer pool
   NativeSectorAlignedBufferPool read_buffer_pool;
   NativeSectorAlignedBufferPool io_buffer_pool;
@@ -681,29 +858,50 @@ class PersistentMemoryMalloc {
   AtomicPageOffset tail_page_offset_;
 
   bool pre_allocate_log_;
-
   bool has_no_backing_storage_;
 
-  /// -- the latest N pages should be mutable.
-  uint32_t num_mutable_pages_;
+  std::atomic<bool> resize_in_progress_;
+  resize_done_callback_t resize_callback_;
 
-  // Circular buffer definition
-  uint8_t** pages_;
-
-  // Array that indicates the status of each buffer page
-  FullPageStatus* page_status_;
+ protected:
+  CircularBuffer buffer_;
 };
 
 /// Implementations.
 template <class D>
-inline void PersistentMemoryMalloc<D>::AllocatePage(uint32_t index) {
-  index = index % buffer_size_;
+inline void PersistentMemoryMalloc<D>::AllocatePage(uint32_t page) {
+  uint32_t index = page % buffer_.max_pages;
   if (!pre_allocate_log_) {
-    assert(pages_[index] == nullptr);
-    pages_[index] = reinterpret_cast<uint8_t*>(aligned_alloc(sector_size, kPageSize));
-    std::memset(pages_[index], 0, kPageSize);
-    // Mark the page as accessible.
-    page_status_[index].status.store(FlushStatus::Flushed, CloseStatus::Open);
+    assert(buffer_.pages[index] == nullptr);
+    buffer_.AllocatePage(index, kPageSize, sector_size);
+  }
+
+  if (resize_in_progress_ && buffer_.InStableState()) {
+    bool expected = true;
+    if (resize_in_progress_.compare_exchange_strong(expected, false)) {
+      // won cas -- issue callback
+      if (resize_callback_) {
+        resize_callback_();
+        resize_callback_ = nullptr;
+      }
+    }
+  }
+}
+
+template <class D>
+inline void PersistentMemoryMalloc<D>::FreePage(uint32_t page) {
+  uint32_t index = page % buffer_.max_pages;
+  buffer_.FreePage(index);
+
+  if (resize_in_progress_ && buffer_.InStableState()) {
+    bool expected = true;
+    if (resize_in_progress_.compare_exchange_strong(expected, false)) {
+      // won cas -- issue callback
+      if (resize_callback_) {
+        resize_callback_();
+        resize_callback_ = nullptr;
+      }
+    }
   }
 }
 
@@ -728,7 +926,7 @@ inline bool PersistentMemoryMalloc<D>::NewPage(uint32_t old_page) {
   assert(old_page < Address::kMaxPage);
   PageOffset new_tail_offset{ old_page + 1, 0 };
   // When the tail advances to page k+1, we clear page k+2.
-  if(old_page + 2 >= safe_head_address.page() + buffer_size_) {
+  if(old_page + 2 >= safe_head_address.page() + buffer_.num_pages) {
     // No room in the circular buffer for a new page; try to advance the head address, to make
     // more room available.
     disk->TryComplete();
@@ -816,10 +1014,8 @@ void PersistentMemoryMalloc<D>::OnPagesClosed(IAsyncContext* ctxt) {
               new_status));
 
       if(old_status.flush == FlushStatus::Flushed) {
-        // We closed the page after it was flushed, so we are responsible for clearing and
-        // reopening it.
-        std::memset(context->allocator->Page(idx), 0, kPageSize);
-        context->allocator->PageStatus(idx).status.store(FlushStatus::Flushed, CloseStatus::Open);
+        // We closed the page after it was flushed, so we are responsible for freeing it
+        context->allocator->FreePage(idx);
       }
     }
   }
@@ -866,7 +1062,7 @@ Status PersistentMemoryMalloc<D>::AsyncFlushPages(uint32_t start_page, Address u
   auto callback = [](IAsyncContext* ctxt, Status result, size_t bytes_transferred) {
     CallbackContext<Context> context{ ctxt };
     if(result != Status::Ok) {
-      log_error("AsyncFlushPages(), error: %u\n", static_cast<uint8_t>(result));
+      log_error("OnPageFlushed() callback: Unexpected result: %s\n", StatusStr(result));
     }
     context->allocator->PageStatus(context->page).LastFlushedUntilAddress.store(
       context->until_address);
@@ -878,11 +1074,8 @@ Status PersistentMemoryMalloc<D>::AsyncFlushPages(uint32_t start_page, Address u
     } while(!context->allocator->PageStatus(context->page).status.compare_exchange_weak(
               old_status, new_status));
     if(old_status.close == CloseStatus::Closed) {
-      // We finished flushing the page after it was closed, so we are responsible for clearing and
-      // reopening it.
-      std::memset(context->allocator->Page(context->page), 0, kPageSize);
-      context->allocator->PageStatus(context->page).status.store(FlushStatus::Flushed,
-          CloseStatus::Open);
+      // We finished flushing the page after it was closed, so we are responsible for freeing it
+      context->allocator->FreePage(context->page);
     }
     context->allocator->ShiftFlushedUntilAddress();
   };
@@ -936,7 +1129,7 @@ Status PersistentMemoryMalloc<D>::AsyncFlushPagesToFile(uint32_t start_page, Add
   auto callback = [](IAsyncContext* ctxt, Status result, size_t bytes_transferred) {
     CallbackContext<Context> context{ ctxt };
     if(result != Status::Ok) {
-      log_error("AsyncFlushPagesToFile(), error: %u\n", static_cast<uint8_t>(result));
+      log_error("AsyncFlushPagesToFile() callback: Unexpected result: %s\n", StatusStr(result));
     }
     assert(context->flush_pending > 0);
     --context->flush_pending;
@@ -996,7 +1189,7 @@ Status PersistentMemoryMalloc<D>::AsyncReadPages(F& read_file, uint32_t file_sta
   auto callback = [](IAsyncContext* ctxt, Status result, size_t bytes_transferred) {
     CallbackContext<Context> context{ ctxt };
     if(result != Status::Ok) {
-      log_error("Error: %u\n", static_cast<uint8_t>(result));
+      log_error("AsyncReadPages() callback: Unexpected result: %s\n", StatusStr(result));
     }
     assert(context->page_status->load() == PageRecoveryStatus::IssuedRead);
     context->page_status->store(PageRecoveryStatus::ReadDone);
@@ -1054,7 +1247,7 @@ Status PersistentMemoryMalloc<D>::AsyncFlushPage(uint32_t page, RecoveryStatus& 
   auto callback = [](IAsyncContext* ctxt, Status result, size_t bytes_transferred) {
     CallbackContext<Context> context{ ctxt };
     if(result != Status::Ok) {
-      log_error("Error: %u\n", static_cast<uint8_t>(result));
+      log_error("AsyncFlushPage() callback: Unexpected result %s\n", StatusStr(result));
     }
     assert(context->page_status->load() == PageRecoveryStatus::IssuedFlush);
     context->page_status->store(PageRecoveryStatus::FlushDone);
@@ -1091,22 +1284,22 @@ void PersistentMemoryMalloc<D>::RecoveryReset(Address begin_address_, Address he
     AllocatePage(end_page + 1);
   }
 
-  for(uint32_t idx = 0; idx < buffer_size_; ++idx) {
+  uint32_t buffer_size = buffer_.num_pages.load();
+  for(uint32_t idx = 0; idx < buffer_size; ++idx) {
     PageStatus(idx).status.store(FlushStatus::Flushed, CloseStatus::Open);
   }
 }
 
 template <class D>
-void PersistentMemoryMalloc<D>::PageAlignedShiftHeadAddress(uint32_t tail_page) {
-  //obtain local values of variables that can change
-  Address current_flushed_until_address = flushed_until_address.load();
-
-  if(tail_page <= (buffer_size_ - kNumHeadPages)) {
+inline void PersistentMemoryMalloc<D>::PageAlignedShiftHeadAddress(uint32_t tail_page) {
+  uint32_t num_pages = buffer_.num_pages.load();
+  if(tail_page <= (num_pages - kNumHeadPages)) {
     // Desired head address is <= 0.
     return;
   }
 
-  Address desired_head_address{ tail_page - (buffer_size_ - kNumHeadPages), 0 };
+  Address current_flushed_until_address = flushed_until_address.load();
+  Address desired_head_address{ tail_page - (num_pages - kNumHeadPages), 0 };
 
   if(current_flushed_until_address < desired_head_address) {
     desired_head_address = Address{ current_flushed_until_address.page(), 0 };
@@ -1124,12 +1317,13 @@ void PersistentMemoryMalloc<D>::PageAlignedShiftHeadAddress(uint32_t tail_page) 
 
 template <class D>
 inline void PersistentMemoryMalloc<D>::PageAlignedShiftReadOnlyAddress(uint32_t tail_page) {
-  if(tail_page <= num_mutable_pages_) {
+  uint32_t num_mutable_pages = buffer_.num_mutable_pages.load();
+  if(tail_page <= num_mutable_pages) {
     // Desired read-only address is <= 0.
     return;
   }
 
-  Address desired_read_only_address{ tail_page - num_mutable_pages_, 0 };
+  Address desired_read_only_address{ tail_page - num_mutable_pages, 0 };
   Address old_read_only_address;
   if(MonotonicUpdate(read_only_address, desired_read_only_address, old_read_only_address)) {
     OnPagesMarkedReadOnly_Context context{ this, desired_read_only_address, false };

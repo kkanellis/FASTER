@@ -349,7 +349,7 @@ class PersistentMemoryMalloc {
   typedef typename D::log_file_t log_file_t;
   typedef PersistentMemoryMalloc<disk_t> alloc_t;
 
-  typedef void(*resize_done_callback_t)(void);
+  typedef void(*resize_done_callback_t)(void* context);
 
   /// Each page in the buffer is 2^25 bytes (= 32 MB).
   static constexpr uint64_t kPageSize = Address::kMaxOffset + 1;
@@ -377,7 +377,9 @@ class PersistentMemoryMalloc {
     , tail_page_offset_{ start_address }
     , pre_allocate_log_{ false }
     , has_no_backing_storage_{ has_no_backing_storage }
-    , resize_in_progress_{ false } {
+    , resize_in_progress_{ false }
+    , resize_callback_{ nullptr }
+    , resize_callback_context_{ nullptr } {
     assert(start_address.page() <= Address::kMaxPage);
 
     log_debug("Log size: %.3lf MiB", static_cast<double>(log_size) / (1 << 20));
@@ -534,16 +536,20 @@ class PersistentMemoryMalloc {
     InitializeBuffer(log_size, log_mutable_pct);
   }
 
-  void Resize(uint64_t new_log_size, resize_done_callback_t callback = nullptr) {
+  void Resize(uint64_t new_log_size,
+              resize_done_callback_t callback = nullptr, void* callback_context = nullptr) {
     // Keep the same log mutable fraction
     double new_log_mutable_fraction = static_cast<double>(buffer_.num_mutable_pages) / buffer_.num_pages;
     Resize(new_log_size, new_log_mutable_fraction, callback);
   }
 
-  void Resize(uint32_t new_log_size, double new_log_mutable_fraction, resize_done_callback_t callback = nullptr) {
+  void Resize(uint64_t new_log_size, double new_log_mutable_fraction,
+              resize_done_callback_t callback = nullptr, void* callback_context = nullptr) {
     bool expected = false;
     if (!resize_in_progress_.compare_exchange_strong(expected, true)) {
-      throw std::runtime_error{ "Active resizing in progress" };
+      //throw std::runtime_error{ "Active resizing in progress" };
+      log_warn("Active resizing in progress. Resizing...");
+      // TODO: Check race conditions with resize_callback_
     }
 
     EnsureValidBufferArgs(new_log_size, new_log_mutable_fraction, false);
@@ -565,6 +571,7 @@ class PersistentMemoryMalloc {
       buffer_.num_pages.store(num_pages);
       buffer_.num_mutable_pages.store(num_mutable_pages);
     }
+    resize_callback_context_ = callback_context;
     resize_callback_ = callback;
   }
 
@@ -862,6 +869,7 @@ class PersistentMemoryMalloc {
 
   std::atomic<bool> resize_in_progress_;
   resize_done_callback_t resize_callback_;
+  void* resize_callback_context_;
 
  protected:
   CircularBuffer buffer_;
@@ -881,8 +889,9 @@ inline void PersistentMemoryMalloc<D>::AllocatePage(uint32_t page) {
     if (resize_in_progress_.compare_exchange_strong(expected, false)) {
       // won cas -- issue callback
       if (resize_callback_) {
-        resize_callback_();
+        resize_callback_(resize_callback_context_);
         resize_callback_ = nullptr;
+        resize_callback_context_ = nullptr;
       }
     }
   }
@@ -898,8 +907,9 @@ inline void PersistentMemoryMalloc<D>::FreePage(uint32_t page) {
     if (resize_in_progress_.compare_exchange_strong(expected, false)) {
       // won cas -- issue callback
       if (resize_callback_) {
-        resize_callback_();
+        resize_callback_(resize_callback_context_);
         resize_callback_ = nullptr;
+        resize_callback_context_ = nullptr;
       }
     }
   }

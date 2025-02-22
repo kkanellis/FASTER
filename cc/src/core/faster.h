@@ -1176,6 +1176,7 @@ inline void FasterKv<K, V, D, H, OH>::CompleteIndexPendingRequests(ExecutionCont
         // NOTE: If needed in the future, implementation is similar to ConditionalInsert
         // but care should be taken wrt the race conditions related to atomic_entry.
         assert(false);
+        throw std::runtime_error{"Not implemented!"};
         break;
       case OperationType::Recovery:
         // Recovery process of cold-log (i.e., when using cold-index, where index requests go pending)
@@ -1189,6 +1190,7 @@ inline void FasterKv<K, V, D, H, OH>::CompleteIndexPendingRequests(ExecutionCont
       default:
         // not reachable
         assert(false);
+        throw std::runtime_error{"Not reachable!"};
         break;
     }
 
@@ -2021,6 +2023,9 @@ inline Status FasterKv<K, V, D, H, OH>::HandleOperationStatus(ExecutionContext& 
       internal_status = InternalConditionalInsert(conditional_insert_context);
       break;
     }
+    default:
+      assert(false); // not reachable
+      break;
     }
 
     if(internal_status == OperationStatus::SUCCESS) {
@@ -4061,6 +4066,7 @@ inline OperationStatus FasterKv<K, V, D, H, OH>::InternalConditionalInsert(C& pe
   // (Note that address will be Address::kInvalidAddress, if the entry was created.)
   if (min_search_offset == Address::kInvalidAddress) {
     // == Only possible in F2-RMW Copy case ==
+    log_error("only possible in RMW");
     // no other record exists for the same key in this log
     if (address == Address::kInvalidAddress) {
       if (pending_context.orig_hlog_tail_address() >= begin_address) {
@@ -4074,6 +4080,7 @@ inline OperationStatus FasterKv<K, V, D, H, OH>::InternalConditionalInsert(C& pe
   }
   else if (address == Address::kInvalidAddress) {
     // == Only possible in F2-RMW Copy case ==
+    log_error("only possible in RMW");
     // record pointed by min_search_offset compacted to cold log
     // it was certainly a hash-collision, because otherwise the initial
     // hot-log RMW would have worked.
@@ -4084,6 +4091,7 @@ inline OperationStatus FasterKv<K, V, D, H, OH>::InternalConditionalInsert(C& pe
   }
   else if (min_search_offset < begin_address) {
     // == Only possible in F2-RMW Copy case ==
+    log_error("only possible in RMW");
     // result of log truncation -- cannot happen during hot-cold/cold-cold compaction
     // request should be re-tried at a higher level!
     return OperationStatus::NOT_FOUND;

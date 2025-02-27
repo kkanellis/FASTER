@@ -100,6 +100,18 @@ constexpr static F2CompactionConfig DEFAULT_F2_COMPACTION_CONFIG{
   }
 };
 
+// Tuning agent config
+struct AgentsConfig {
+  bool enabled;
+  std::chrono::seconds observation_period_secs;
+};
+
+constexpr static AgentsConfig DEFAULT_AGENTS_CONFIG{
+  .enabled = true,
+  .observation_period_secs = 10s,
+  // observation_num_ops = 1000000
+};
+
 
 // FASTER store config
 
@@ -203,6 +215,7 @@ struct FasterKvConfig{
   HlogCompactionConfig hlog_compaction_config;
   ReadCacheConfig rc_config;
   std::string filepath;
+  AgentsConfig agents_config;
 
   #ifdef TOML_CONFIG
   template<typename... Ts>
@@ -236,7 +249,11 @@ struct FasterKvConfig{
     // Read cache
     ReadCacheConfig rc_config = PopulateReadCacheConfig<IsColdStore>(top_table);
 
-    return { index_config, hlog_config, hlog_compaction_config, rc_config, filepath };
+    // Agents
+    AgentsConfig agents_config = DEFAULT_AGENTS_CONFIG;
+
+    return { index_config, hlog_config, hlog_compaction_config,
+             rc_config, filepath, agents_config };
   }
   #endif
 };

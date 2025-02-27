@@ -125,7 +125,7 @@ class ReadCacheEvictContext : public IAsyncContext {
 
 };
 
-typedef void(*ReadCacheEvictCallback)(void* readcache, Address from_head_address, Address to_head_address);
+typedef Address(*ReadCacheEvictCallback)(void* readcache, Address from_head_address, Address to_head_address);
 
 template <class D>
 class ReadCachePersistentMemoryMalloc : public PersistentMemoryMalloc<D> {
@@ -144,20 +144,6 @@ class ReadCachePersistentMemoryMalloc : public PersistentMemoryMalloc<D> {
   }
 
   ~ReadCachePersistentMemoryMalloc() { }
-
-  bool FlushAndEvict(bool wait) {
-    bool success;
-    Address tail_address = ShiftHeadAddressToTail(success);
-    if (!success) {
-      return false;
-    }
-
-    while (wait && this->safe_head_address < tail_address) {
-      // wait until flush is done
-      this->epoch_->ProtectAndDrain();
-    }
-    return true;
-  }
 
   void SetReadCacheInstance(void* readcache) {
     readcache_ = readcache;
@@ -181,51 +167,31 @@ class ReadCachePersistentMemoryMalloc : public PersistentMemoryMalloc<D> {
     if(current_flushed_until_address < desired_head_address) {
       desired_head_address = Address{ current_flushed_until_address.page(), 0 };
     }
-
-    // allow the readcache to clean up
-    if (desired_head_address > current_head_address) {
-      evict_callback_(readcache_, current_head_address, desired_head_address);
+    if (desired_head_address <= current_head_address) {
+      // Current head address is already ahead of desired head address.
+      return;
     }
 
+    Address evicted_to = evict_callback_(readcache_, current_head_address, desired_head_address);
+    if (evicted_to == Address::kInvalidAddress) {
+      return;
+    }
+    assert(evicted_to > current_head_address);
+
     Address old_head_address;
-    if(this->MonotonicUpdate(this->head_address, desired_head_address, old_head_address)) {
-      typename PersistentMemoryMalloc<D>::OnPagesClosed_Context context{ this, desired_head_address, false };
+    if(this->MonotonicUpdate(this->head_address, evicted_to, old_head_address)) {
+      typename PersistentMemoryMalloc<D>::OnPagesClosed_Context context{ this, evicted_to, false };
       IAsyncContext* context_copy;
       Status result = context.DeepCopy(context_copy);
       assert(result == Status::Ok);
       this->epoch_->BumpCurrentEpoch(this->OnPagesClosed, context_copy);
+    } else {
+      log_error("MonotonicUpdate failed: %lu -> %lu [%lu]", current_head_address.control(),
+                evicted_to.control(), old_head_address.control());
+      throw std::runtime_error{ "MonotonicUpdate for head_address not successful" };
     }
   }
 
-  Address ShiftHeadAddressToTail(bool& success) {
-    Address tail_address = this->GetTailAddress();
-
-    // Attempt to shift read-only address
-    Address old_read_only_address;
-    if (!(success = this->MonotonicUpdate(this->read_only_address, tail_address, old_read_only_address))) {
-      return tail_address;
-    }
-    // Shift read-only address to tail
-    typename PersistentMemoryMalloc<D>::OnPagesMarkedReadOnly_Context ro_context{ this, tail_address, false };
-    IAsyncContext* ro_context_copy;
-    Status result = ro_context.DeepCopy(ro_context_copy);
-    assert(result == Status::Ok);
-    this->epoch_->BumpCurrentEpoch(this->OnPagesMarkedReadOnly, ro_context_copy);
-
-    // Attempt to shift head address
-    Address old_head_address;
-    if (!(success = this->MonotonicUpdate(this->head_address, tail_address, old_head_address))) {
-      return tail_address;
-    }
-    // Shift head address to tail
-    typename PersistentMemoryMalloc<D>::OnPagesClosed_Context h_context{ this, tail_address, false };
-    IAsyncContext* h_context_copy;
-    result = h_context.DeepCopy(h_context_copy);
-    assert(result == Status::Ok);
-    this->epoch_->BumpCurrentEpoch(this->OnPagesClosed, h_context_copy);
-
-    return tail_address;
-  }
 
  private:
   void* readcache_;

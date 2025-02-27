@@ -5,14 +5,16 @@
 
 #define _SILENCE_EXPERIMENTAL_FILESYSTEM_DEPRECATION_WARNING
 
+#include <algorithm>
 #include <atomic>
 #include <cassert>
 #include <cinttypes>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 #include <type_traits>
-#include <algorithm>
 #include <unordered_set>
 
 #ifdef STATISTICS
@@ -47,6 +49,7 @@
 #include "utility.h"
 
 using namespace std::chrono_literals;
+using namespace FASTER::agent;
 using namespace FASTER::index;
 
 /// The FASTER key-value store, and related classes.
@@ -139,6 +142,7 @@ class FasterKv {
            double hlog_mutable_fraction = DEFAULT_HLOG_MUTABLE_FRACTION,
            ReadCacheConfig rc_config = DEFAULT_READ_CACHE_CONFIG,
            HlogCompactionConfig hlog_compaction_config = DEFAULT_HLOG_COMPACTION_CONFIG,
+           AgentsConfig agents_config = DEFAULT_AGENTS_CONFIG,
            bool pre_allocate_log = false, const std::string& config = "")
     : system_state_{ Action::None, Phase::REST, 1 }
     , disk{ filepath, epoch_, config }
@@ -158,7 +162,10 @@ class FasterKv {
     , hlog_compaction_config_{ hlog_compaction_config }
     , auto_compaction_active_{ false }
     , auto_compaction_scheduled_{ false }
-    , max_hlog_size_{ 0 } {
+    , max_hlog_size_{ 0 }
+    , agents_config_{ agents_config }
+    , memory_agent_{ nullptr }
+    , agents_monitor_{ "agents-monitor" } {
 
     log_debug("Hash Index Size: %lu", index_config.table_size);
     hash_index_.Initialize(index_config);
@@ -166,15 +173,31 @@ class FasterKv {
       hash_index_.SetRefreshCallback(static_cast<void*>(this), DoRefreshCallback);
     }
 
+    memory_allocation_ = MemoryAllocation{ .hlog_budget = hlog_mem_size, .rc_budget = rc_config.mem_size };
+    if (agents_config.enabled) {
+      // TODO: update when hash index size is accounted for
+      uint64_t total_budget = memory_allocation_.hlog_budget + memory_allocation_.rc_budget;
+      memory_agent_ = std::make_unique<MemoryAgent>(epoch_, memory_allocation_, total_budget);
+    }
+
     log_debug("Read cache is %s", rc_config.enabled ? "ENABLED" : "DISABLED");
     if (rc_config.enabled) {
-      read_cache_ = std::make_unique<read_cache_t>(epoch_, hash_index_, hlog, rc_config);
+      read_cache_ = std::make_unique<read_cache_t>(epoch_, hash_index_, hlog, rc_config, memory_agent_.get());
+    } else {
+      log_debug("Disabling MemoryAgent (read-cache is DISABLED)");
     }
 
     log_debug("Auto compaction is %s", hlog_compaction_config.enabled ? "ENABLED" : "DISABLED");
     if (hlog_compaction_config.enabled) {
       auto_compaction_active_.store(true);
       compaction_thread_ = std::move(std::thread(&FasterKv::AutoCompactHlog, this));
+    }
+
+    if (memory_agent_.get() != nullptr) {
+      log_debug("Agents thread [check_interval: %lus]", agents_config.observation_period_secs);
+      agents_monitor_.Launch(&FasterKv::MonitorSystem, this);
+    } else {
+      log_info("Skipping AGENT MONITOR thread -- no agents enabled.");
     }
 
     #ifdef STATISTICS
@@ -185,7 +208,8 @@ class FasterKv {
   FasterKv(const Config& config)
     : FasterKv{ config.index_config, config.hlog_config.in_mem_size, config.filepath,
                 config.hlog_config.mutable_fraction, config.rc_config,
-                config.hlog_compaction_config, config.hlog_config.pre_allocate } {
+                config.hlog_compaction_config, config.agents_config,
+                config.hlog_config.pre_allocate } {
   }
 
   ~FasterKv() {
@@ -195,7 +219,15 @@ class FasterKv {
     if (compaction_thread_.joinable()) {
       // shut down compaction thread
       auto_compaction_active_.store(false);
+      log_debug("Waiting on compaction thread...");
       compaction_thread_.join();
+    }
+
+    // Agents monitor thread
+    if (agents_monitor_.launched) {
+      agents_monitor_.SignalShutdown();
+      log_debug("Waiting on agent monitor thread...");
+      agents_monitor_.thread.join();
     }
   }
 
@@ -384,6 +416,8 @@ class FasterKv {
 
   // Auto-compaction daemon
   void AutoCompactHlog();
+  // Agents daemon
+  void MonitorSystem();
 
   /// Access the current and previous (thread-local) execution contexts.
   const ExecutionContext& thread_ctx() const {
@@ -441,6 +475,75 @@ class FasterKv {
   static constexpr int kNumCompactionThreads = 8;
   static constexpr bool fold_over_snapshot = true;
 
+  class BackgroundThread {
+   public:
+    BackgroundThread(const std::string& name_)
+      : launched{ false }
+      , exit{ false }
+      , active{ false }
+      , name{ name_ } {
+    }
+
+    template <class F, class... Args>
+    void Launch(F&& f, Args&&... args) {
+      Resume();
+      thread = std::move(std::thread(f, args...));
+      launched.store(true);
+    }
+
+    void Resume(bool expected_inactive = true) {
+      bool is_active = active.load();
+      if (!is_active) {
+        while(!is_active && active.compare_exchange_strong(is_active, true)) {
+          std::this_thread::yield();
+        }
+
+        active_cv.notify_one();
+      } else if (expected_inactive) {
+        log_warn("Background thread [%s] expected to be *inactive* "
+                 "-- was active instead!", name.c_str());
+      }
+    }
+
+    void Pause(bool expected_active = true) {
+      bool is_active = active.load();
+      if (is_active) {
+        while(is_active && active.compare_exchange_strong(is_active, false)) {
+          std::this_thread::yield();
+        }
+      } else if (expected_active) {
+        log_warn("Background thread [%s] expected to be *active* "
+                 "-- was inactive instead!", name.c_str());
+      }
+    }
+
+    void BlockUntilActivation() {
+      std::unique_lock<std::mutex> lk{ mtx };
+      active_cv.wait(lk, [this]{ return active.load() || exit.load(); });
+    }
+
+    void BlockUntilNextCheck(const std::chrono::seconds& max_sleep_duration) {
+      std::unique_lock<std::mutex> lk{ mtx };
+      sleep_cv.wait_for(lk, max_sleep_duration,
+        [this]{ return !active.load() || exit.load(); });
+    }
+
+    void SignalShutdown() {
+      exit.store(true);
+      Pause(false);
+    }
+
+    std::string name;
+    std::thread thread;
+
+    std::atomic<bool> launched;
+    std::atomic<bool> exit;
+    std::atomic<bool> active;
+    std::condition_variable active_cv;
+    std::condition_variable sleep_cv;
+    std::mutex mtx;
+  };
+
   const bool read_cache_enabled_;
 
   /// Initial size of the index table
@@ -485,6 +588,29 @@ class FasterKv {
 
   // Hard limit of log size
   uint64_t max_hlog_size_;
+
+  // Agents
+  AgentsConfig agents_config_;
+  MemoryAllocation memory_allocation_;
+
+  std::unique_ptr<MemoryAgent> memory_agent_;
+
+  BackgroundThread agents_monitor_;
+
+  struct ResizeContext {
+    ResizeContext(std::string name_)
+      : done{ false }
+      , name{ name_ } {
+    }
+    void Reset() {
+      done.store(false);
+    }
+    std::atomic<bool> done;
+    std::condition_variable cv;
+    std::string name;
+  };
+  ResizeContext hlog_resize_ctx_{ "HLOG" };
+  ResizeContext rc_resize_ctx_{ "READ-CACHE" };
 
 #ifdef STATISTICS
  public:
@@ -4511,6 +4637,160 @@ void FasterKv<K, V, D, H, OH>::AutoCompactHlog() {
   // no more auto-compactions
   auto_compaction_scheduled_.store(false);
 }
+
+template <class K, class V, class D, class H, class OH>
+void FasterKv<K, V, D, H, OH>::MonitorSystem() {
+  auto& thread_ctx = agents_monitor_;
+  auto observation_period_secs = agents_config_.observation_period_secs;
+
+  std::mutex mtx;
+  auto resize_done_cb = [](void* context) {
+    if (!context) {
+      log_error("[resize_cb]: No context provided!");
+      return;
+    }
+    ResizeContext* ctx = static_cast<ResizeContext*>(context);
+    if (ctx->done.load()) {
+      log_warn("[resize_cb]: %s done flag already set to TRUE!", ctx->name.c_str());
+    }
+    ctx->done.store(true);
+    ctx->cv.notify_one();
+    log_rep("[resize_cb] %s resize completed!", ctx->name.c_str());
+  };
+
+  log_debug("[agents-monitor] Started!");
+  thread_ctx.BlockUntilNextCheck(observation_period_secs);
+
+  MemoryAllocation new_allocation;
+  while (!thread_ctx.exit.load()) {
+
+    while(thread_ctx.active.load()) {
+
+      uint32_t tail_address_page = hlog.GetTailAddress().page();
+      if (!memory_agent_->ShouldUpdateAllocation(tail_address_page, new_allocation)) {
+        // wait until next check
+        log_rep("No memory allocation update required!");
+        thread_ctx.BlockUntilNextCheck(observation_period_secs);
+        continue;
+      }
+
+      log_rep("Target Memory Allocation: HLOG [%.2lf GiB -> %.2lf GiB], READ-CACHE [%.2lf GiB -> %.2lf GiB]",
+              static_cast<double>(memory_allocation_.hlog_budget) / (1 << 30UL),
+              static_cast<double>(new_allocation.hlog_budget) / (1 << 30UL),
+              static_cast<double>(memory_allocation_.rc_budget) / (1 << 30UL),
+              static_cast<double>(new_allocation.rc_budget) / (1 << 30UL));
+
+      // Incremental resizing of HLOG and READ-CACHE
+      int64_t hlog_budget_num_pages_diff = \
+        (static_cast<int64_t>(new_allocation.hlog_budget) - static_cast<int64_t>(memory_allocation_.hlog_budget)) / static_cast<int64_t>(hlog.kPageSize);
+      int64_t rc_budget_num_pages_diff = \
+        (static_cast<int64_t>(new_allocation.rc_budget) - static_cast<int64_t>(memory_allocation_.rc_budget)) / static_cast<int64_t>(read_cache_->read_cache_.kPageSize);
+
+      log_rep("RC budget: %ld, %ld [PageSize: %lu]", new_allocation.rc_budget, memory_allocation_.rc_budget, read_cache_->read_cache_.kPageSize);
+
+      log_rep("Memory allocation diff: HLOG [%ld pages], READ-CACHE [%ld pages]",
+              hlog_budget_num_pages_diff, rc_budget_num_pages_diff);
+
+      while (hlog_budget_num_pages_diff != 0 || rc_budget_num_pages_diff != 0) {
+        //
+        int64_t next_hlog_budget = memory_allocation_.hlog_budget;
+        if (hlog_budget_num_pages_diff > 0) {
+          next_hlog_budget += hlog.kPageSize;
+          --hlog_budget_num_pages_diff;
+        } else if (hlog_budget_num_pages_diff < 0) {
+          next_hlog_budget -= hlog.kPageSize;
+          ++hlog_budget_num_pages_diff;
+        }
+        //
+        int64_t next_rc_budget = memory_allocation_.rc_budget;
+        if (rc_budget_num_pages_diff > 0) {
+          next_rc_budget += read_cache_->read_cache_.kPageSize;
+          --rc_budget_num_pages_diff;
+        } else if (rc_budget_num_pages_diff < 0) {
+          next_rc_budget -= read_cache_->read_cache_.kPageSize;
+          ++rc_budget_num_pages_diff;
+        }
+        log_rep("Memory allocation update: HLOG [%.2lf GiB -> %.2lf GiB], READ-CACHE [%.2lf GiB -> %.2lf GiB]",
+                static_cast<double>(memory_allocation_.hlog_budget) / (1 << 30UL),
+                static_cast<double>(next_hlog_budget) / (1 << 30UL),
+                static_cast<double>(memory_allocation_.rc_budget) / (1 << 30UL),
+                static_cast<double>(next_rc_budget) / (1 << 30UL));
+
+        if (next_hlog_budget < memory_allocation_.hlog_budget) {
+          // Shrink hlog
+          log_rep("Issuing HLOG shrink to [%.2lf GiB]...",
+                  static_cast<double>(next_hlog_budget) / (1 << 30UL));
+          hlog_resize_ctx_.Reset();
+          hlog.Resize(next_hlog_budget, resize_done_cb, static_cast<void*>(&hlog_resize_ctx_));
+
+          // Wait until resize operation is completed
+          std::unique_lock<std::mutex> lk{ mtx };
+          hlog_resize_ctx_.cv.wait(lk, [this] {
+            return hlog_resize_ctx_.done.load();
+          });
+          log_rep("HLOG shrinking completed!");
+        }
+        if (next_rc_budget < memory_allocation_.rc_budget) {
+          // Shrink RC
+          log_rep("Issuing READ-CACHE resize to [%.2lf GiB]...",
+                  static_cast<double>(next_rc_budget) / (1 << 30UL));
+          rc_resize_ctx_.Reset();
+          read_cache_->read_cache_.Resize(next_rc_budget, resize_done_cb, static_cast<void*>(&rc_resize_ctx_));
+
+          // Wait until resize operation is completed
+          std::unique_lock<std::mutex> lk{ mtx };
+          rc_resize_ctx_.cv.wait(lk, [this] {
+            return rc_resize_ctx_.done.load();
+          });
+          log_rep("READ-CACHE shrinking completed!");
+        }
+
+        if (next_hlog_budget > memory_allocation_.hlog_budget) {
+          // Expand HLOG
+          log_rep("Issuing HLOG resize to [%.2lf GiB]...",
+                  static_cast<double>(next_hlog_budget) / (1 << 30UL));
+          hlog_resize_ctx_.Reset();
+          hlog.Resize(next_hlog_budget, resize_done_cb, static_cast<void*>(&hlog_resize_ctx_));
+
+          // Wait until resize operation is completed
+          std::unique_lock<std::mutex> lk{ mtx };
+          hlog_resize_ctx_.cv.wait(lk, [this] {
+            return hlog_resize_ctx_.done.load();
+          });
+          log_rep("HLOG expending completed!");
+        }
+        if (next_rc_budget > memory_allocation_.rc_budget) {
+          // Expand RC
+          log_rep("Issuing READ-CACHE resize to [%.2lf GiB]...",
+                  static_cast<double>(next_rc_budget) / (1 << 30UL));
+          rc_resize_ctx_.Reset();
+          read_cache_->read_cache_.Resize(next_rc_budget, resize_done_cb, static_cast<void*>(&rc_resize_ctx_));
+
+          // Wait until resize operation is completed
+          std::unique_lock<std::mutex> lk{ mtx };
+          rc_resize_ctx_.cv.wait(lk, [this] {
+            return rc_resize_ctx_.done.load();
+          });
+          log_rep("READ-CACHE expanding completed!");
+        }
+
+        // Update (current) memory allocation
+        memory_allocation_.hlog_budget = next_hlog_budget;
+        memory_allocation_.rc_budget = next_rc_budget;
+      }
+
+      // Ignore stats gathered during resizing (i.e., transient phase)
+      memory_agent_->BumpEpoch();
+      // Wait until the observation period is over
+      thread_ctx.BlockUntilNextCheck(observation_period_secs);
+    }
+
+    thread_ctx.BlockUntilActivation(); // wait on mutex to avoid utilizing CPU core
+  }
+
+  log_debug("[agents-monitor] Exiting...");
+}
+
 
 #ifdef TOML_CONFIG
 template <class K, class V, class D, class H, class OH>

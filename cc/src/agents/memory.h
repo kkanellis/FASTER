@@ -54,7 +54,7 @@ class MemoryAgent {
  public:
 	constexpr static uint64_t kSamplingInterval = 1024;
   constexpr static uint32_t kMaxNumInMemPages = 4096; // (4096 pages -> 128 GiB)
-  constexpr static uint32_t kMaxNumFilters = 100;
+  constexpr static int32_t kMaxNumFilters = 100;
   constexpr static uint8_t kNumMemoryComponents = static_cast<uint8_t>(MemoryComponent::NUM);
 
   constexpr static uint8_t kHlogWriteComponent = static_cast<uint8_t>(MemoryComponent::HLOG_WRITE);
@@ -62,33 +62,39 @@ class MemoryAgent {
   constexpr static uint8_t kReadCacheComponent = static_cast<uint8_t>(MemoryComponent::READ_CACHE);
 
   constexpr static uint64_t kMinAddress = Constants::kCacheLineBytes;
+  constexpr static uint32_t kMinNumPages = 6;
 
   // Candidate allocations better than current, with expected improvement (%)
   // *less than* this, would not be applied
   constexpr static uint8_t kMinExpectedPctImprovement = 2;
 
-  MemoryAgent(LightEpoch& epoch, MemoryAllocation& curr_allocation, uint16_t num_allocations = 2)
+  MemoryAgent(LightEpoch& epoch, MemoryAllocation& curr_allocation, uint64_t total_budget)
     : epoch_{ epoch }
-		, curr_allocation_{ curr_allocation }
+		, current_allocation{ curr_allocation }
+    , total_budget_{ total_budget }
     , prev_tail_address_page_{ 0 } {
 
 		std::memset(op_counter_, 0, kNumMemoryComponents * Thread::kMaxNumThreads * sizeof(uint64_t));
     rc_filters_ = std::make_unique<BlockedBloomFilter[]>(kMaxNumFilters);
 	}
 
-  inline bool UpdateAllocation(uint32_t tail_address_page) {
-    curr_allocation_.Print();
-    log_info("Checking for better memory allocation...");
-
-    // Seal histograms
+  inline void BumpEpoch() {
+    log_rep("Bumping epoch...");
     for (uint8_t component = 0; component < kNumMemoryComponents; component++) {
-      histograms_[component].SealAndBump();
+      histograms_[component].BumpEpoch();
     }
+  }
+
+  inline bool ShouldUpdateAllocation(uint32_t hlog_tail_address_page, MemoryAllocation& new_allocation) {
+    BumpEpoch();
+
+    log_info("Checking for better memory allocation...");
+    current_allocation.Print();
 
     // Compute expected hit-rate for hlog-reads based on hlog page insertion rate
     std::vector<uint64_t> hlog_read_cdf = histograms_[kHlogReadComponent].ComputeCDF();
-    u_int64_t hlog_expected_new_inserted_pages = tail_address_page - prev_tail_address_page_;
-    prev_tail_address_page_ = tail_address_page; // update prev_tail_address_page_ for next iteration
+    u_int64_t hlog_expected_new_inserted_pages = hlog_tail_address_page - prev_tail_address_page_;
+    prev_tail_address_page_ = hlog_tail_address_page; // update prev_tail_address_page_ for next iteration
     histograms_[kHlogReadComponent].PrintCDF("HLOG Read CDF");
 
     // Compute expected hit-rate for hlog-writes and read-cache
@@ -98,30 +104,32 @@ class MemoryAgent {
     histograms_[kReadCacheComponent].PrintCDF("Read Cache CDF");
 
     // Compute best allocation
-    uint64_t mem_budget = curr_allocation_.hlog_budget + curr_allocation_.rc_budget;
-    uint32_t max_pages = mem_budget / Histogram::kPageSize;
+    // TODO: Account for hash index size (i.e., hash table size + overflow buckets)
+    uint32_t max_pages = total_budget_ / Histogram::kPageSize;
 
     MemoryAllocation best_allocation;
     uint64_t best_total_hits = 0;
 
-    for (uint32_t hlog_num_pages = 0; hlog_num_pages < max_pages; hlog_num_pages++) {
-      uint32_t rc_num_pages = max_pages - hlog_num_pages - 1;
+    for (uint32_t hlog_num_pages = kMinNumPages; hlog_num_pages < max_pages; hlog_num_pages++) {
+      uint32_t rc_num_pages = max_pages - hlog_num_pages;
+      if (rc_num_pages < kMinNumPages) {
+        break; // skip if read-cache has less than kMinNumPages
+      }
 
-      uint64_t hlog_expected_hits = hlog_write_cdf[hlog_num_pages];
       uint64_t rc_expected_hits = read_cache_cdf[rc_num_pages];
 
-      uint64_t candidate_total_hits = hlog_expected_hits + rc_expected_hits;
-      candidate_total_hits += (hlog_num_pages < hlog_expected_new_inserted_pages)
-                                ? hlog_read_cdf[hlog_num_pages]
-                                : hlog_read_cdf[hlog_expected_new_inserted_pages];
+      uint64_t hlog_expected_write_hits = hlog_write_cdf[hlog_num_pages];
+      uint64_t hlog_expected_read_hits = (hlog_num_pages < hlog_expected_new_inserted_pages)
+                                            ? hlog_read_cdf[hlog_num_pages]
+                                            : hlog_read_cdf[hlog_expected_new_inserted_pages];
+      uint64_t candidate_total_hits = hlog_expected_write_hits + hlog_expected_read_hits + rc_expected_hits;
 
       log_rep("HLOG: %lu | RC: %lu | Total Hits: %lu", hlog_num_pages, rc_num_pages, candidate_total_hits);
-
       MemoryAllocation candidate_allocation = MemoryAllocation{ hlog_num_pages * Histogram::kPageSize,
                                                                 rc_num_pages * Histogram::kPageSize };
       bool found_better = (candidate_total_hits > best_total_hits) ||
                           ((candidate_total_hits == best_total_hits) // break ties by choosing closest to current allocation
-                            && (candidate_allocation.Dist(curr_allocation_) < best_allocation.Dist(curr_allocation_)));
+                            && (candidate_allocation.Dist(current_allocation) < best_allocation.Dist(current_allocation)));
 
       if (candidate_total_hits > best_total_hits) {
         log_rep("Found better allocation: HLOG: %lu | RC: %lu | Total Hits: %lu",
@@ -130,11 +138,11 @@ class MemoryAgent {
         best_allocation = candidate_allocation;
       }
     }
+
     log_rep("Best Allocation:");
     best_allocation.Print();
 
-    curr_allocation_ = best_allocation;
-
+    new_allocation = best_allocation;
     return true;
   }
 
@@ -182,10 +190,11 @@ class MemoryAgent {
     }
 
     // cache-miss
-    uint32_t head_address_page = tail_address_page - (curr_allocation_.rc_budget / Histogram::kPageSize);
-    uint32_t from_page = std::max(static_cast<uint32_t>(0), head_address_page - kMaxNumFilters);
+    int32_t head_address_page = static_cast<int32_t>(tail_address_page) - \
+                                static_cast<int32_t>(current_allocation.rc_budget / Histogram::kPageSize));
+    int32_t from_page = std::max(static_cast<int32_t>(0), head_address_page - kMaxNumFilters);
 
-    for (uint32_t evicted_page = head_address_page; evicted_page >= from_page; evicted_page--) {
+    for (int32_t evicted_page = head_address_page; evicted_page >= from_page; evicted_page--) {
       auto& f = GetFilter(evicted_page);
       if (!f.IsReady()) {
         continue;
@@ -226,7 +235,8 @@ class MemoryAgent {
  private:
 
   LightEpoch& epoch_;
-  MemoryAllocation& curr_allocation_;
+  MemoryAllocation& current_allocation;
+  uint64_t total_budget_;
   uint32_t prev_tail_address_page_;
 
   Histogram histograms_[kNumMemoryComponents];

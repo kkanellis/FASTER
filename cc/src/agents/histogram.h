@@ -23,7 +23,7 @@ class Histogram {
       histogram_[i].resize(num_pages_);
     }
     cdf_.resize(num_pages_);
-    SealAndBump();
+    BumpEpoch();
   }
 
   // Add a page distance to the histogram
@@ -38,12 +38,11 @@ class Histogram {
     }
   }
 
-  void SealAndBump() {
+  void BumpEpoch() {
     uint8_t next_version = 1 - version_.load();
     for (uint64_t i = 0; i < num_pages_; i++) {
       histogram_[next_version][i] = 0;
     }
-    // Bump version
     version_ = 1 - version_.load();
   }
 

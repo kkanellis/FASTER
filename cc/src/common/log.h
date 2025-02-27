@@ -72,9 +72,8 @@ inline void log_msg(Lvl level, int line, const char* func,
   vsnprintf(buffer, 1024, fmt, argptr);
 
   std::string l = LvlStr[static_cast<uint8_t>(level)];
-  fprintf(stderr, "[%04lu.%05lu]{%2u}::%s::%s:%d: %s\n",
-          (unsigned long) std::chrono::duration_cast<std::chrono::seconds>(now - start).count(),
-          (unsigned long) std::chrono::duration_cast<std::chrono::nanoseconds>(now - start).count(),
+  fprintf(stderr, "[%015.9lf]{%3u}::%s::%s:%d: %s\n",
+          std::chrono::duration_cast<std::chrono::nanoseconds>(now - start).count() / 1e9,
           FASTER::core::Thread::id(), l.c_str(), file, line, buffer);
 
   va_end(argptr);

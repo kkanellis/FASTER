@@ -114,11 +114,13 @@ static_assert(sizeof(AtomicFlushCloseStatus) == 2, "sizeof(FlushCloseStatus) != 
 struct FullPageStatus {
   FullPageStatus()
     : LastFlushedUntilAddress{ 0 }
-    , status{} {
+    , status{}
+    , num_records{ 0 } {
   }
 
   AtomicAddress LastFlushedUntilAddress;
   AtomicFlushCloseStatus status;
+  std::atomic<uint32_t> num_records;
 };
 static_assert(sizeof(FullPageStatus) == 16, "sizeof(FullPageStatus) != 16");
 
@@ -254,6 +256,7 @@ class CircularBuffer {
       pages[idx] = nullptr;
       page_status[idx].LastFlushedUntilAddress.store(0);
       page_status[idx].status.store(FlushStatus::Flushed, CloseStatus::Closed);
+      page_status[idx].num_records.store(0);
     }
   }
   void Clear() {
@@ -294,9 +297,9 @@ class CircularBuffer {
       // No free pages available -- allocate new page
       ++num_allocated_pages_;
       page = reinterpret_cast<uint8_t*>(aligned_alloc(alignment, bytes));
-      log_debug("No page in queue -- allocating new page: %p", page);
+      //log_debug("No page in queue -- allocating new page: %p", page);
     } else {
-      log_debug("Free page exists in queue: %p", page);
+      //log_debug("Free page exists in queue: %p", page);
     }
     assert(page != nullptr);
     // Clear and set page
@@ -304,8 +307,9 @@ class CircularBuffer {
     std::memset(pages[index], 0, bytes);
 
     // Mark the page as accessible.
+    page_status[index].num_records.store(0);
     page_status[index].status.store(FlushStatus::Flushed, CloseStatus::Open);
-    log_debug("Allocated %lu pages", num_allocated_pages_.load());
+    //log_debug("Allocated %lu pages", num_allocated_pages_.load());
   }
 
   void FreePage(uint32_t index) {
@@ -316,15 +320,15 @@ class CircularBuffer {
     uint8_t* page = pages[index];
     if (num_allocated_pages_ - 1 < num_pages) {
       // do not free page -- it is going to be requested soon
-      log_debug("Storing page to queue: %p", page);
+      //log_debug("Storing page to queue: %p", page);
       free_pages_queue_.push(page);
     } else {
-      log_debug("Deallocating page from memory: %p", page);
+      //log_debug("Deallocating page from memory: %p", page);
       aligned_free(page);
       --num_allocated_pages_;
     }
     pages[index] = nullptr;
-    log_debug("Allocated %lu pages", num_allocated_pages_.load());
+    //log_debug("Allocated %lu pages", num_allocated_pages_.load());
   }
 
  public:
@@ -423,6 +427,15 @@ class PersistentMemoryMalloc {
   inline FullPageStatus& PageStatus(uint32_t page) {
     assert(page <= Address::kMaxPage);
     return buffer_.page_status[page % buffer_.max_pages];
+  }
+
+  inline std::atomic<uint32_t>& PageSize(uint32_t page) const {
+    assert(page <= Address::kMaxPage);
+    return buffer_.page_status[page % buffer_.max_pages].num_records;
+  }
+  inline std::atomic<uint32_t>& PageSize(uint32_t page) {
+    assert(page <= Address::kMaxPage);
+    return buffer_.page_status[page % buffer_.max_pages].num_records;
   }
 
   inline uint32_t buffer_size() const {
@@ -755,7 +768,7 @@ class PersistentMemoryMalloc {
       if (throw_) {
         throw std::invalid_argument{ "Must have at least 2 non-head pages" };
       } else {
-        log_info("Log size too small (i.e., <= 160 MiB). "
+        log_info("Log size too small (i.e., <= 192 MiB). "
                  "Adjusting num pages to %u (from %u)", num_pages, kNumHeadPages + 2);
         num_pages = kNumHeadPages + 2;
         log_size = num_pages * kPageSize;

@@ -280,7 +280,8 @@ class CircularBuffer {
   }
 
   bool InStableState() {
-    return num_pages.load() == num_allocated_pages_.load();
+    log_rep("num_pages: %u, num_allocated_pages: %u", num_pages.load(), num_allocated_pages_.load());
+    return num_pages.load() >= num_allocated_pages_.load();
   }
 
   void AllocatePage(uint32_t index, uint64_t bytes, uint32_t alignment) {
@@ -379,7 +380,6 @@ class PersistentMemoryMalloc {
     , flushed_until_address{ start_address }
     , begin_address{ start_address }
     , tail_page_offset_{ start_address }
-    , pre_allocate_log_{ false }
     , has_no_backing_storage_{ has_no_backing_storage }
     , resize_in_progress_{ false }
     , resize_callback_{ nullptr }
@@ -553,7 +553,7 @@ class PersistentMemoryMalloc {
               resize_done_callback_t callback = nullptr, void* callback_context = nullptr) {
     // Keep the same log mutable fraction
     double new_log_mutable_fraction = static_cast<double>(buffer_.num_mutable_pages) / buffer_.num_pages;
-    Resize(new_log_size, new_log_mutable_fraction, callback);
+    Resize(new_log_size, new_log_mutable_fraction, callback, callback_context);
   }
 
   void Resize(uint64_t new_log_size, double new_log_mutable_fraction,
@@ -673,6 +673,9 @@ class PersistentMemoryMalloc {
   inline void AllocatePage(uint32_t page);
   /// Free memory page
   inline void FreePage(uint32_t page);
+
+  /// Checks if resizing is done; if so, calls the callback
+  inline void PollResizeStatus();
 
  protected:
   /// Used by several functions to update the variable to newValue. Ignores if newValue is smaller
@@ -877,7 +880,6 @@ class PersistentMemoryMalloc {
   // Global address of the current tail (next element to be allocated from the circular buffer)
   AtomicPageOffset tail_page_offset_;
 
-  bool pre_allocate_log_;
   bool has_no_backing_storage_;
 
   std::atomic<bool> resize_in_progress_;
@@ -892,30 +894,21 @@ class PersistentMemoryMalloc {
 template <class D>
 inline void PersistentMemoryMalloc<D>::AllocatePage(uint32_t page) {
   uint32_t index = page % buffer_.max_pages;
-  if (!pre_allocate_log_) {
-    assert(buffer_.pages[index] == nullptr);
-    buffer_.AllocatePage(index, kPageSize, sector_size);
-  }
-
-  if (resize_in_progress_ && buffer_.InStableState()) {
-    bool expected = true;
-    if (resize_in_progress_.compare_exchange_strong(expected, false)) {
-      // won cas -- issue callback
-      if (resize_callback_) {
-        resize_callback_(resize_callback_context_);
-        resize_callback_ = nullptr;
-        resize_callback_context_ = nullptr;
-      }
-    }
-  }
+  assert(buffer_.pages[index] == nullptr);
+  buffer_.AllocatePage(index, kPageSize, sector_size);
+  PollResizeStatus();
 }
 
 template <class D>
 inline void PersistentMemoryMalloc<D>::FreePage(uint32_t page) {
   uint32_t index = page % buffer_.max_pages;
   buffer_.FreePage(index);
+  PollResizeStatus();
+}
 
-  if (resize_in_progress_ && buffer_.InStableState()) {
+template <class D>
+inline void PersistentMemoryMalloc<D>::PollResizeStatus() {
+  if (resize_in_progress_.load() && buffer_.InStableState()) {
     bool expected = true;
     if (resize_in_progress_.compare_exchange_strong(expected, false)) {
       // won cas -- issue callback
@@ -1085,7 +1078,7 @@ Status PersistentMemoryMalloc<D>::AsyncFlushPages(uint32_t start_page, Address u
   auto callback = [](IAsyncContext* ctxt, Status result, size_t bytes_transferred) {
     CallbackContext<Context> context{ ctxt };
     if(result != Status::Ok) {
-      log_error("OnPageFlushed() callback: Unexpected result: %s\n", StatusStr(result));
+      log_error("OnPageFlushed() callback: Unexpected result: %s", StatusStr(result));
     }
     context->allocator->PageStatus(context->page).LastFlushedUntilAddress.store(
       context->until_address);
